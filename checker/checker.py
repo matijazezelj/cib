@@ -129,7 +129,7 @@ POLICY_CHECKS = [
 
 def check_container_policy(container) -> dict[str, bool]:
     """Return dict of check_name → pass (True=good, False=violation)."""
-    hc = container.host_config
+    hc = container.attrs.get("HostConfig", {})
     cfg = container.attrs.get("Config", {})
 
     results = {}

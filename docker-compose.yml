@@ -6,7 +6,7 @@ services:
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - trivy-cache:/root/.cache/trivy
+      - cib-trivy-cache:/root/.cache/trivy
       - cib-data:/data
     environment:
       - VICTORIAMETRICS_URL=${VICTORIAMETRICS_URL:-http://cib-victoriametrics:8428}
@@ -21,13 +21,13 @@ services:
       - cib-victoriametrics
 
   cib-victoriametrics:
-    image: victoriametrics/victoria-metrics:stable
+    image: victoriametrics/victoria-metrics:latest
     container_name: cib-victoriametrics
     restart: unless-stopped
     ports:
       - "${VICTORIAMETRICS_PORT:-8431}:8428"
     volumes:
-      - victoriametrics-data:/storage
+      - cib-victoriametrics-data:/storage
     command:
       - --storageDataPath=/storage
       - --retentionPeriod=${VICTORIAMETRICS_RETENTION:-90d}
@@ -47,7 +47,7 @@ services:
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/etc/grafana/dashboards/cib-overview.json
     volumes:
-      - grafana-data:/var/lib/grafana
+      - cib-grafana-data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/etc/grafana/dashboards:ro
     networks:
@@ -60,7 +60,7 @@ networks:
     name: cib
 
 volumes:
-  victoriametrics-data:
-  grafana-data:
-  trivy-cache:
+  cib-victoriametrics-data:
+  cib-grafana-data:
+  cib-trivy-cache:
   cib-data:

@@ -39,7 +39,7 @@
       },
       "targets": [{
         "datasource": { "type": "prometheus", "uid": "cib-vm" },
-        "expr": "cib_total_policy_violations",
+        "expr": "last_over_time(cib_total_policy_violations[8h])",
         "legendFormat": "Violations",
         "refId": "A"
       }]
@@ -72,7 +72,7 @@
       },
       "targets": [{
         "datasource": { "type": "prometheus", "uid": "cib-vm" },
-        "expr": "cib_eol_images_total",
+        "expr": "last_over_time(cib_eol_images_total[8h])",
         "legendFormat": "EOL Images",
         "refId": "A"
       }]
@@ -105,7 +105,7 @@
       },
       "targets": [{
         "datasource": { "type": "prometheus", "uid": "cib-vm" },
-        "expr": "sum(cib_license_violations_total) or vector(0)",
+        "expr": "sum(last_over_time(cib_license_violations_total[8h])) or vector(0)",
         "legendFormat": "License Violations",
         "refId": "A"
       }]
@@ -131,7 +131,7 @@
       },
       "targets": [{
         "datasource": { "type": "prometheus", "uid": "cib-vm" },
-        "expr": "cib_images_checked_total",
+        "expr": "last_over_time(cib_images_checked_total[8h])",
         "legendFormat": "Images",
         "refId": "A"
       }]
@@ -200,7 +200,7 @@
       ],
       "targets": [{
         "datasource": { "type": "prometheus", "uid": "cib-vm" },
-        "expr": "cib_policy_violation",
+        "expr": "last_over_time(cib_policy_violation[8h])",
         "instant": true,
         "legendFormat": "{{container}} — {{check}}",
         "refId": "A"
@@ -242,7 +242,7 @@
       ],
       "targets": [{
         "datasource": { "type": "prometheus", "uid": "cib-vm" },
-        "expr": "cib_image_eol",
+        "expr": "last_over_time(cib_image_eol[8h])",
         "instant": true,
         "legendFormat": "{{image}}",
         "refId": "A"
@@ -291,7 +291,7 @@
       ],
       "targets": [{
         "datasource": { "type": "prometheus", "uid": "cib-vm" },
-        "expr": "cib_license_violation",
+        "expr": "last_over_time(cib_license_violation[8h])",
         "instant": true,
         "legendFormat": "{{image}} — {{package}}",
         "refId": "A"
