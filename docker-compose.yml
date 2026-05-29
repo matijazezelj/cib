@@ -1,0 +1,66 @@
+services:
+
+  cib-checker:
+    build: ./checker
+    container_name: cib-checker
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - trivy-cache:/root/.cache/trivy
+      - cib-data:/data
+    environment:
+      - VICTORIAMETRICS_URL=${VICTORIAMETRICS_URL:-http://cib-victoriametrics:8428}
+      - SCAN_INTERVAL_HOURS=${SCAN_INTERVAL_HOURS:-6}
+      - SCAN_ON_STARTUP=${SCAN_ON_STARTUP:-true}
+      - TRIVY_TIMEOUT=${TRIVY_TIMEOUT:-300}
+      - ADDITIONAL_IMAGES=${ADDITIONAL_IMAGES:-}
+      - LICENSE_DENY_LIST=${LICENSE_DENY_LIST:-}
+    networks:
+      - cib
+    depends_on:
+      - cib-victoriametrics
+
+  cib-victoriametrics:
+    image: victoriametrics/victoria-metrics:stable
+    container_name: cib-victoriametrics
+    restart: unless-stopped
+    ports:
+      - "${VICTORIAMETRICS_PORT:-8431}:8428"
+    volumes:
+      - victoriametrics-data:/storage
+    command:
+      - --storageDataPath=/storage
+      - --retentionPeriod=${VICTORIAMETRICS_RETENTION:-90d}
+      - --httpListenAddr=:8428
+    networks:
+      - cib
+
+  cib-grafana:
+    image: grafana/grafana:latest
+    container_name: cib-grafana
+    restart: unless-stopped
+    ports:
+      - "${GRAFANA_PORT:-3003}:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-changeme}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/etc/grafana/dashboards/cib-overview.json
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+    networks:
+      - cib
+    depends_on:
+      - cib-victoriametrics
+
+networks:
+  cib:
+    name: cib
+
+volumes:
+  victoriametrics-data:
+  grafana-data:
+  trivy-cache:
+  cib-data:
