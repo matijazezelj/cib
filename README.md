@@ -6,6 +6,8 @@ CIB mounts the Docker socket, scans every running container image with Trivy (Cy
 
 Part of the [in-a-box-tools](https://in-a-box-tools.tech) ecosystem.
 
+![Dashboard preview](docs/dashboard-preview.png)
+
 ---
 
 ## What you get
