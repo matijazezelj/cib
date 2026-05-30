@@ -5,6 +5,7 @@ services:
     container_name: cib-checker
     restart: unless-stopped
     volumes:
+      # Remove this line when using DOCKER_HOST=tcp://... (remote daemon)
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - cib-trivy-cache:/root/.cache/trivy
       - cib-data:/data
@@ -15,6 +16,7 @@ services:
       - TRIVY_TIMEOUT=${TRIVY_TIMEOUT:-300}
       - ADDITIONAL_IMAGES=${ADDITIONAL_IMAGES:-}
       - LICENSE_DENY_LIST=${LICENSE_DENY_LIST:-}
+      - DOCKER_HOST=${DOCKER_HOST:-}
     networks:
       - cib
     depends_on:

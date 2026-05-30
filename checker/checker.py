@@ -39,6 +39,10 @@ ADDITIONAL_IMAGES = [
 ]
 SBOM_DIR = Path(os.environ.get("SBOM_DIR", "/data/sboms"))
 
+# Remote Docker host — set to tcp://host:port to scan a remote daemon
+# Defaults to local Unix socket (docker.from_env() / trivy default behaviour)
+DOCKER_HOST = os.environ.get("DOCKER_HOST", "")
+
 # Licenses that violate policy by default (copyleft — problematic for proprietary stacks)
 # Override via LICENSE_DENY_LIST env var (comma-separated SPDX IDs)
 _default_deny = "GPL-2.0-only,GPL-2.0-or-later,GPL-3.0-only,GPL-3.0-or-later,AGPL-3.0-only,AGPL-3.0-or-later"
@@ -188,8 +192,10 @@ def scan_sbom(image: str) -> dict | None:
         "--quiet",
         "--timeout", f"{TRIVY_TIMEOUT}s",
         "--output", str(out_path),
-        image,
     ]
+    if DOCKER_HOST:
+        cmd.extend(["--docker-host", DOCKER_HOST])
+    cmd.append(image)
     try:
         subprocess.run(cmd, capture_output=True, timeout=int(TRIVY_TIMEOUT) + 30, check=True)
         with open(out_path) as f:
@@ -209,8 +215,10 @@ def scan_trivy_json(image: str) -> dict | None:
         "--format", "json",
         "--quiet",
         "--timeout", f"{TRIVY_TIMEOUT}s",
-        image,
     ]
+    if DOCKER_HOST:
+        cmd.extend(["--docker-host", DOCKER_HOST])
+    cmd.append(image)
     try:
         result = subprocess.run(
             cmd, capture_output=True, timeout=int(TRIVY_TIMEOUT) + 30, check=True

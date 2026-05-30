@@ -40,7 +40,7 @@ The first scan starts immediately (5–15 minutes, Trivy pulls license DB on fir
 ## Requirements
 
 - Docker + Docker Compose v2
-- `/var/run/docker.sock` mounted (included in `docker-compose.yml`)
+- `/var/run/docker.sock` mounted (included in `docker-compose.yml`) **or** `DOCKER_HOST=tcp://host:port` for a remote daemon
 - Outbound internet (Trivy DB + endoflife.date API)
 
 ---
@@ -56,6 +56,7 @@ The first scan starts immediately (5–15 minutes, Trivy pulls license DB on fir
 | `SCAN_ON_STARTUP` | `true` | Scan immediately on start |
 | `TRIVY_TIMEOUT` | `300` | Trivy timeout per image (seconds) |
 | `ADDITIONAL_IMAGES` | — | Extra images to scan beyond running containers |
+| `DOCKER_HOST` | — | Remote Docker daemon (`tcp://host:port`); leave unset for local socket |
 | `LICENSE_DENY_LIST` | GPL/AGPL | Comma-separated SPDX IDs to flag as violations |
 
 ### Customising the license deny list
