@@ -14,6 +14,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, date, timezone
 from pathlib import Path
@@ -30,22 +31,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger("cib")
 
-_shutdown = False
+_shutdown = threading.Event()
 
 
 def _handle_sigterm(signum, frame):
-    global _shutdown
-    _shutdown = True
+    _shutdown.set()
 
 
 signal.signal(signal.SIGTERM, _handle_sigterm)
+signal.signal(signal.SIGINT, _handle_sigterm)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 VICTORIAMETRICS_URL = os.environ.get("VICTORIAMETRICS_URL", "http://cib-victoriametrics:8428")
-SCAN_INTERVAL_HOURS = float(os.environ.get("SCAN_INTERVAL_HOURS", "6"))
+try:
+    SCAN_INTERVAL_HOURS = float(os.environ.get("SCAN_INTERVAL_HOURS", "6"))
+except ValueError as e:
+    logger.error("Invalid SCAN_INTERVAL_HOURS: %s", e)
+    sys.exit(1)
 SCAN_ON_STARTUP = os.environ.get("SCAN_ON_STARTUP", "true").lower() == "true"
-TRIVY_TIMEOUT = int(os.environ.get("TRIVY_TIMEOUT", "300"))
+try:
+    TRIVY_TIMEOUT = int(os.environ.get("TRIVY_TIMEOUT", "300"))
+except ValueError as e:
+    logger.error("Invalid TRIVY_TIMEOUT: %s", e)
+    sys.exit(1)
 ADDITIONAL_IMAGES = [
     i.strip() for i in os.environ.get("ADDITIONAL_IMAGES", "").split(",") if i.strip()
 ]
@@ -56,9 +65,9 @@ DOCKER_HOST = os.environ.get("DOCKER_HOST", "")
 
 # Licenses that violate policy by default (copyleft — problematic for proprietary stacks)
 _default_deny = "GPL-2.0-only,GPL-2.0-or-later,GPL-3.0-only,GPL-3.0-or-later,AGPL-3.0-only,AGPL-3.0-or-later"
-LICENSE_DENY_LIST = set(
-    os.environ.get("LICENSE_DENY_LIST", _default_deny).split(",")
-)
+LICENSE_DENY_LIST = {
+    s.strip() for s in os.environ.get("LICENSE_DENY_LIST", _default_deny).split(",") if s.strip()
+}
 
 # EOL check: map Trivy OS family names to endoflife.date product names
 EOL_PRODUCT_MAP = {
@@ -73,6 +82,10 @@ EOL_PRODUCT_MAP = {
     "almalinux": "almalinux",
     "sles": "sles",
     "opensuse": "opensuse",
+    "oracle": "oracle-linux",
+    "photon": "photon",
+    "wolfi": "wolfi",
+    "chainguard": "chainguard",
 }
 
 SESSION = requests.Session()
@@ -146,11 +159,21 @@ def _push(lines: list[str]) -> None:
             )
             resp.raise_for_status()
             break
-        except Exception as e:
+        except requests.exceptions.ConnectionError as e:
             if attempt == 0:
                 time.sleep(2)
             else:
                 logger.error("Metric push failed after retry: %s", e)
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else 0
+            if 500 <= status < 600 and attempt == 0:
+                time.sleep(2)
+            else:
+                logger.error("Metric push failed (HTTP %s): %s", status, e)
+                break
+        except Exception as e:
+            logger.error("Metric push failed: %s", e)
+            break
 
 
 # ── Docker discovery ──────────────────────────────────────────────────────────
@@ -285,7 +308,11 @@ def scan_sbom(image: str, docker_url: str = "") -> dict | None:
 
 
 def scan_trivy_json(image: str, docker_url: str = "") -> dict | None:
-    """Run trivy in JSON mode (for OS metadata + vuln data)."""
+    """Run trivy in JSON mode (for OS metadata + vuln data).
+
+    Trivy returns exit code 1 when vulnerabilities are found — that's still a
+    successful scan, so we accept returncodes 0 and 1 and parse stdout either way.
+    """
     cmd = [
         "trivy", "image",
         "--format", "json",
@@ -296,9 +323,15 @@ def scan_trivy_json(image: str, docker_url: str = "") -> dict | None:
         cmd.extend(["--docker-host", docker_url])
     cmd.append(image)
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, timeout=TRIVY_TIMEOUT + 30, check=True
-        )
+        result = subprocess.run(cmd, capture_output=True, timeout=TRIVY_TIMEOUT + 30)
+        if result.returncode not in (0, 1):
+            logger.warning(
+                "trivy json exited %d for %s: %s",
+                result.returncode, image,
+                result.stderr.decode(errors='replace')[:200],
+            )
+        if not result.stdout:
+            return None
         return json.loads(result.stdout)
     except Exception as e:
         logger.warning("Trivy JSON scan failed for %s: %s", image, e)
@@ -307,6 +340,14 @@ def scan_trivy_json(image: str, docker_url: str = "") -> dict | None:
 
 # ── License compliance ────────────────────────────────────────────────────────
 
+def _split_spdx_expression(expr: str) -> list[str]:
+    """Split a simple SPDX expression into individual license identifiers."""
+    tokens = [expr]
+    for sep in (" OR ", " AND ", " WITH "):
+        tokens = [piece for tok in tokens for piece in tok.split(sep)]
+    return [t.strip(" ()") for t in tokens if t.strip(" ()")]
+
+
 def check_licenses(image: str, sbom: dict) -> list[dict]:
     """Return list of license violations: {package, version, license}."""
     violations = []
@@ -314,6 +355,12 @@ def check_licenses(image: str, sbom: dict) -> list[dict]:
         name = component.get("name", "")
         version = component.get("version", "")
         for lic_entry in component.get("licenses", []):
+            expression = lic_entry.get("expression")
+            if expression:
+                for lic_id in _split_spdx_expression(expression):
+                    if lic_id in LICENSE_DENY_LIST:
+                        violations.append({"package": name, "version": version, "license": lic_id})
+                continue
             lic = lic_entry.get("license", {})
             lic_id = lic.get("id") or lic.get("name") or ""
             if lic_id in LICENSE_DENY_LIST:
@@ -362,6 +409,7 @@ def check_eol(image: str, trivy_data: dict) -> dict | None:
 
     product = EOL_PRODUCT_MAP.get(family)
     if not product:
+        logger.debug("no EOL data for %s", family)
         return None
 
     cycle = _parse_version_cycle(os_name)
@@ -372,10 +420,8 @@ def check_eol(image: str, trivy_data: dict) -> dict | None:
             timeout=10,
         )
         if r.status_code == 404:
-            r = SESSION.get(
-                f"https://endoflife.date/api/{quote(product)}/{quote(os_name.split('.')[0])}.json",
-                timeout=10,
-            )
+            logger.debug("EOL 404 for %s/%s — skipping", product, cycle)
+            return None
         if not r.ok:
             return None
 
@@ -469,10 +515,9 @@ def run_scan() -> None:
                             ", ".join(sorted({v["license"] for v in violations})))
             else:
                 logger.info("  %s — %d components, no license violations", image, total_components)
+            total_images += 1
         else:
             push_license_metrics(image, [], 0, host=host_name)
-
-        total_images += 1
 
     for host_name, docker_url in hosts:
         logger.info("── Host: %s (%s) ──", host_name, docker_url or "local socket")
@@ -499,12 +544,20 @@ def run_scan() -> None:
         # 2. Image SBOM + license + EOL checks
         images = discover_images(docker_url, client=client)
         for image in images:
+            if _shutdown.is_set():
+                logger.info("Shutdown requested — aborting scan loop")
+                break
             scan_image_full(image, docker_url, host_name)
+        if _shutdown.is_set():
+            break
 
     # Scan ADDITIONAL_IMAGES once, outside the per-host loop, under "additional" host label
-    if ADDITIONAL_IMAGES:
+    if ADDITIONAL_IMAGES and not _shutdown.is_set():
         logger.info("── Host: additional (extra images) ──")
         for image in ADDITIONAL_IMAGES:
+            if _shutdown.is_set():
+                logger.info("Shutdown requested — aborting scan loop")
+                break
             scan_image_full(image, "", "additional")
 
     push_summary(total_images, total_containers, total_violations, eol_count)
@@ -524,12 +577,11 @@ def main() -> None:
 
     schedule.every(SCAN_INTERVAL_HOURS).hours.do(run_scan)
 
-    while True:
-        if _shutdown:
-            logger.info("SIGTERM received, exiting.")
-            break
+    while not _shutdown.is_set():
         schedule.run_pending()
-        time.sleep(60)
+        if _shutdown.wait(60):
+            break
+    logger.info("Shutdown signal received, exiting.")
 
 
 if __name__ == "__main__":
