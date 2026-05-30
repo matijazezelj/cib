@@ -11,11 +11,13 @@ Pushes all results to VictoriaMetrics.
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 import time
 from datetime import datetime, date, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 import docker
 import requests
@@ -28,12 +30,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger("cib")
 
+_shutdown = False
+
+
+def _handle_sigterm(signum, frame):
+    global _shutdown
+    _shutdown = True
+
+
+signal.signal(signal.SIGTERM, _handle_sigterm)
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 VICTORIAMETRICS_URL = os.environ.get("VICTORIAMETRICS_URL", "http://cib-victoriametrics:8428")
 SCAN_INTERVAL_HOURS = float(os.environ.get("SCAN_INTERVAL_HOURS", "6"))
 SCAN_ON_STARTUP = os.environ.get("SCAN_ON_STARTUP", "true").lower() == "true"
-TRIVY_TIMEOUT = os.environ.get("TRIVY_TIMEOUT", "300")
+TRIVY_TIMEOUT = int(os.environ.get("TRIVY_TIMEOUT", "300"))
 ADDITIONAL_IMAGES = [
     i.strip() for i in os.environ.get("ADDITIONAL_IMAGES", "").split(",") if i.strip()
 ]
@@ -81,15 +93,23 @@ def _parse_docker_hosts() -> list[tuple[str, str]]:
     raw = os.environ.get("DOCKER_HOSTS", "").strip()
     if raw:
         hosts = []
+        valid_schemes = ("tcp://", "unix://", "ssh://", "npipe://")
         for entry in raw.split(","):
             entry = entry.strip()
             if not entry:
                 continue
             if "=" in entry:
                 name, url = entry.split("=", 1)
-                hosts.append((name.strip(), url.strip()))
+                name, url = name.strip(), url.strip()
             else:
-                hosts.append(("docker", entry.strip()))
+                name, url = "docker", entry.strip()
+            if not name or not url:
+                logger.warning("Skipping DOCKER_HOSTS entry with empty name or url: %r", entry)
+                continue
+            if not url.startswith(valid_schemes):
+                logger.warning("Skipping DOCKER_HOSTS entry with invalid scheme: %r", entry)
+                continue
+            hosts.append((name, url))
         return hosts
     if DOCKER_HOST:
         return [("docker", DOCKER_HOST)]
@@ -104,8 +124,8 @@ def _docker_client(docker_url: str) -> docker.DockerClient:
 
 # ── Metric helpers ────────────────────────────────────────────────────────────
 
-def _safe_label(s: str) -> str:
-    return str(s).replace('"', '\\"').replace("\n", "").replace("\\", "\\\\")
+def _safe_label(value: str) -> str:
+    return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
 def _ts_ms() -> int:
@@ -116,34 +136,49 @@ def _push(lines: list[str]) -> None:
     if not lines:
         return
     payload = "\n".join(lines) + "\n"
-    try:
-        SESSION.post(
-            f"{VICTORIAMETRICS_URL}/api/v1/import/prometheus",
-            data=payload,
-            headers={"Content-Type": "text/plain"},
-            timeout=10,
-        ).raise_for_status()
-    except Exception as e:
-        logger.error("Metric push failed: %s", e)
+    for attempt in range(2):
+        try:
+            resp = SESSION.post(
+                f"{VICTORIAMETRICS_URL}/api/v1/import/prometheus",
+                data=payload,
+                headers={"Content-Type": "text/plain"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            break
+        except Exception as e:
+            if attempt == 0:
+                time.sleep(2)
+            else:
+                logger.error("Metric push failed after retry: %s", e)
 
 
 # ── Docker discovery ──────────────────────────────────────────────────────────
 
-def discover_images(docker_url: str = "") -> list[str]:
+def discover_images(docker_url: str = "", client=None) -> list[str]:
     try:
-        client = _docker_client(docker_url)
-        images = set(ADDITIONAL_IMAGES)
+        if client is None:
+            client = _docker_client(docker_url)
+        images = set()
         for c in client.containers.list():
-            images.add(c.image.tags[0] if c.image.tags else c.image.id)
+            try:
+                if c.image and c.image.tags:
+                    images.add(c.image.tags[0])
+                elif c.image:
+                    images.add(c.image.id)
+            except Exception:
+                continue
         return sorted(images)
     except Exception as e:
         logger.warning("Docker discovery failed: %s", e)
-        return list(ADDITIONAL_IMAGES)
+        return []
 
 
-def get_containers(docker_url: str = "") -> list[docker.models.containers.Container]:
+def get_containers(docker_url: str = "", client=None) -> list[docker.models.containers.Container]:
     try:
-        return _docker_client(docker_url).containers.list()
+        if client is None:
+            client = _docker_client(docker_url)
+        return client.containers.list()
     except Exception as e:
         logger.warning("Could not list containers: %s", e)
         return []
@@ -173,7 +208,8 @@ def check_container_policy(container) -> dict[str, bool]:
     results["not_privileged"] = not hc.get("Privileged", False)
 
     user = cfg.get("User", "")
-    results["non_root_user"] = bool(user) and not user.startswith("0") and user != "root"
+    user_id = user.split(":")[0] if user else ""
+    results["non_root_user"] = user_id not in ("0", "root", "")
 
     sec_opts = hc.get("SecurityOpt") or []
     results["no_new_privileges"] = any("no-new-privileges" in o for o in sec_opts)
@@ -231,12 +267,18 @@ def scan_sbom(image: str, docker_url: str = "") -> dict | None:
         cmd.extend(["--docker-host", docker_url])
     cmd.append(image)
     try:
-        subprocess.run(cmd, capture_output=True, timeout=int(TRIVY_TIMEOUT) + 30, check=True)
+        result = subprocess.run(cmd, capture_output=True, timeout=TRIVY_TIMEOUT + 30)
+        if result.returncode != 0:
+            logger.warning(
+                "trivy sbom exited %d for %s: %s",
+                result.returncode, image,
+                result.stderr.decode(errors='replace')[:200],
+            )
+        # still try to parse if output file exists
+        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            return None
         with open(out_path) as f:
             return json.load(f)
-    except subprocess.CalledProcessError as e:
-        logger.warning("Trivy SBOM scan failed for %s: %s", image, e.stderr.decode()[:200])
-        return None
     except Exception as e:
         logger.warning("SBOM scan error for %s: %s", image, e)
         return None
@@ -255,7 +297,7 @@ def scan_trivy_json(image: str, docker_url: str = "") -> dict | None:
     cmd.append(image)
     try:
         result = subprocess.run(
-            cmd, capture_output=True, timeout=int(TRIVY_TIMEOUT) + 30, check=True
+            cmd, capture_output=True, timeout=TRIVY_TIMEOUT + 30, check=True
         )
         return json.loads(result.stdout)
     except Exception as e:
@@ -326,12 +368,12 @@ def check_eol(image: str, trivy_data: dict) -> dict | None:
 
     try:
         r = SESSION.get(
-            f"https://endoflife.date/api/{product}/{cycle}.json",
+            f"https://endoflife.date/api/{quote(product)}/{quote(cycle)}.json",
             timeout=10,
         )
         if r.status_code == 404:
             r = SESSION.get(
-                f"https://endoflife.date/api/{product}/{os_name.split('.')[0]}.json",
+                f"https://endoflife.date/api/{quote(product)}/{quote(os_name.split('.')[0])}.json",
                 timeout=10,
             )
         if not r.ok:
@@ -403,11 +445,46 @@ def run_scan() -> None:
     total_images = 0
     eol_count = 0
 
+    def scan_image_full(image: str, docker_url: str, host_name: str) -> None:
+        nonlocal total_images, eol_count
+        logger.info("Scanning image: %s", image)
+
+        trivy_data = scan_trivy_json(image, docker_url)
+
+        eol_info = check_eol(image, trivy_data) if trivy_data else None
+        push_eol_metrics(image, eol_info, host=host_name)
+        if eol_info and eol_info["is_eol"]:
+            logger.info("  %s — EOL base OS: %s %s (eol: %s)",
+                        image, eol_info["family"], eol_info["version"], eol_info["eol_date"])
+            eol_count += 1
+
+        sbom = scan_sbom(image, docker_url)
+        if sbom:
+            total_components = len(sbom.get("components", []))
+            violations = check_licenses(image, sbom)
+            push_license_metrics(image, violations, total_components, host=host_name)
+            if violations:
+                logger.info("  %s — %d license violations (%s)",
+                            image, len(violations),
+                            ", ".join(sorted({v["license"] for v in violations})))
+            else:
+                logger.info("  %s — %d components, no license violations", image, total_components)
+        else:
+            push_license_metrics(image, [], 0, host=host_name)
+
+        total_images += 1
+
     for host_name, docker_url in hosts:
         logger.info("── Host: %s (%s) ──", host_name, docker_url or "local socket")
 
+        try:
+            client = _docker_client(docker_url)
+        except Exception as e:
+            logger.warning("Could not create Docker client for %s: %s", host_name, e)
+            client = None
+
         # 1. Container policy checks
-        containers = get_containers(docker_url)
+        containers = get_containers(docker_url, client=client)
         total_containers += len(containers)
         for container in containers:
             name = container.name
@@ -420,34 +497,15 @@ def run_scan() -> None:
             push_policy_metrics(name, checks, host=host_name)
 
         # 2. Image SBOM + license + EOL checks
-        images = discover_images(docker_url)
+        images = discover_images(docker_url, client=client)
         for image in images:
-            logger.info("Scanning image: %s", image)
+            scan_image_full(image, docker_url, host_name)
 
-            trivy_data = scan_trivy_json(image, docker_url)
-
-            eol_info = check_eol(image, trivy_data) if trivy_data else None
-            push_eol_metrics(image, eol_info, host=host_name)
-            if eol_info and eol_info["is_eol"]:
-                logger.info("  %s — EOL base OS: %s %s (eol: %s)",
-                            image, eol_info["family"], eol_info["version"], eol_info["eol_date"])
-                eol_count += 1
-
-            sbom = scan_sbom(image, docker_url)
-            if sbom:
-                total_components = len(sbom.get("components", []))
-                violations = check_licenses(image, sbom)
-                push_license_metrics(image, violations, total_components, host=host_name)
-                if violations:
-                    logger.info("  %s — %d license violations (%s)",
-                                image, len(violations),
-                                ", ".join({v["license"] for v in violations}))
-                else:
-                    logger.info("  %s — %d components, no license violations", image, total_components)
-            else:
-                push_license_metrics(image, [], 0, host=host_name)
-
-            total_images += 1
+    # Scan ADDITIONAL_IMAGES once, outside the per-host loop, under "additional" host label
+    if ADDITIONAL_IMAGES:
+        logger.info("── Host: additional (extra images) ──")
+        for image in ADDITIONAL_IMAGES:
+            scan_image_full(image, "", "additional")
 
     push_summary(total_images, total_containers, total_violations, eol_count)
     logger.info("─── CIB scan complete in %.0fs across %d host(s) ───",
@@ -467,6 +525,9 @@ def main() -> None:
     schedule.every(SCAN_INTERVAL_HOURS).hours.do(run_scan)
 
     while True:
+        if _shutdown:
+            logger.info("SIGTERM received, exiting.")
+            break
         schedule.run_pending()
         time.sleep(60)
 
