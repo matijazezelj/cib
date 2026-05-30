@@ -28,7 +28,7 @@ services:
     container_name: cib-victoriametrics
     restart: unless-stopped
     ports:
-      - "${VICTORIAMETRICS_PORT:-8431}:8428"
+      - "${BIND_ADDR:-127.0.0.1}:${VICTORIAMETRICS_PORT:-8431}:8428"
     volumes:
       - cib-victoriametrics-data:/storage
     command:
@@ -43,7 +43,7 @@ services:
     container_name: cib-grafana
     restart: unless-stopped
     ports:
-      - "${GRAFANA_PORT:-3003}:3000"
+      - "${BIND_ADDR:-127.0.0.1}:${GRAFANA_PORT:-3003}:3000"
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-changeme}
