@@ -17,6 +17,7 @@ services:
       - ADDITIONAL_IMAGES=${ADDITIONAL_IMAGES:-}
       - LICENSE_DENY_LIST=${LICENSE_DENY_LIST:-}
       - DOCKER_HOST=${DOCKER_HOST:-}
+      - DOCKER_HOSTS=${DOCKER_HOSTS:-}
     networks:
       - cib
     depends_on:
