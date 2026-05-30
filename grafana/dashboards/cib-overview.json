@@ -195,15 +195,15 @@
         ]
       },
       "transformations": [
-        { "id": "labelsToFields", "options": { "valueLabel": "value", "mode": "columns" } },
         { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true }, "indexByName": {}, "renameByName": {} } }
       ],
       "targets": [{
         "datasource": { "type": "prometheus", "uid": "cib-vm" },
         "expr": "last_over_time(cib_policy_violation[8h])",
         "instant": true,
-        "legendFormat": "{{container}} — {{check}}",
-        "refId": "A"
+        "legendFormat": "",
+        "refId": "A",
+        "format": "table"
       }]
     },
     {
@@ -237,15 +237,15 @@
         ]
       },
       "transformations": [
-        { "id": "labelsToFields", "options": { "valueLabel": "value", "mode": "columns" } },
         { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true }, "indexByName": {}, "renameByName": {} } }
       ],
       "targets": [{
         "datasource": { "type": "prometheus", "uid": "cib-vm" },
         "expr": "last_over_time(cib_image_eol[8h])",
         "instant": true,
-        "legendFormat": "{{image}}",
-        "refId": "A"
+        "legendFormat": "",
+        "refId": "A",
+        "format": "table"
       }]
     },
     {
@@ -286,15 +286,15 @@
         ]
       },
       "transformations": [
-        { "id": "labelsToFields", "options": { "valueLabel": "value", "mode": "columns" } },
         { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true }, "indexByName": {}, "renameByName": {} } }
       ],
       "targets": [{
         "datasource": { "type": "prometheus", "uid": "cib-vm" },
         "expr": "last_over_time(cib_license_violation[8h])",
         "instant": true,
-        "legendFormat": "{{image}} — {{package}}",
-        "refId": "A"
+        "legendFormat": "",
+        "refId": "A",
+        "format": "table"
       }]
     },
     {
