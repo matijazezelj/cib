@@ -20,4 +20,4 @@ scan-now:
 
 clean:
 	docker compose down -v
-	docker rmi cib-checker 2>/dev/null || true
+	docker rmi cib-cib-checker 2>/dev/null || true
