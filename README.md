@@ -72,15 +72,17 @@ LICENSE_DENY_LIST=AGPL-3.0-only,AGPL-3.0-or-later
 
 | Metric | Labels | Description |
 |--------|--------|-------------|
-| `cib_policy_violation` | `container`, `check` | 1 if the check fails, 0 if it passes |
-| `cib_container_policy_score` | `container` | % of checks passing (0–100) |
-| `cib_image_eol` | `image`, `os`, `version`, `eol_date` | 1 if base OS is EOL |
-| `cib_license_violation` | `image`, `package`, `version`, `license` | 1 per license violation |
-| `cib_license_violations_total` | `image` | Total violations per image |
-| `cib_sbom_components_total` | `image` | Total SBOM component count |
+| `cib_policy_violation` | `container`, `check`, `host` | 1 if the check fails, 0 if it passes |
+| `cib_container_policy_score` | `container`, `host` | % of checks passing (0–100) |
+| `cib_image_eol` | `image`, `os`, `version`, `eol_date`, `host` | 1 if base OS is EOL |
+| `cib_eol_unknown` | `image`, `host` | 1 when no EOL data could be resolved |
+| `cib_license_violation` | `image`, `package`, `version`, `license`, `host` | 1 per license violation |
+| `cib_license_violations_total` | `image`, `host` | Total violations per image |
+| `cib_sbom_components_total` | `image`, `host` | Total SBOM component count |
 | `cib_total_policy_violations` | — | Sum of all policy violations |
 | `cib_eol_images_total` | — | Count of EOL images |
 | `cib_images_checked_total` | — | Images checked in last run |
+| `cib_containers_checked_total` | — | Containers policy-checked in last run |
 | `cib_last_scan_timestamp` | — | Last scan Unix timestamp (ms) |
 
 ### Policy checks

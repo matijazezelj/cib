@@ -11,6 +11,7 @@ Pushes all results to VictoriaMetrics.
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -65,8 +66,12 @@ DOCKER_HOST = os.environ.get("DOCKER_HOST", "")
 
 # Licenses that violate policy by default (copyleft — problematic for proprietary stacks)
 _default_deny = "GPL-2.0-only,GPL-2.0-or-later,GPL-3.0-only,GPL-3.0-or-later,AGPL-3.0-only,AGPL-3.0-or-later"
+# `or` rather than a get() default: docker-compose passes
+# LICENSE_DENY_LIST=${LICENSE_DENY_LIST:-}, so the variable is always *set* and
+# a get() default never applies — which silently left the deny list empty and
+# license checking a no-op for every compose-based run.
 LICENSE_DENY_LIST = {
-    s.strip() for s in os.environ.get("LICENSE_DENY_LIST", _default_deny).split(",") if s.strip()
+    s.strip() for s in (os.environ.get("LICENSE_DENY_LIST") or _default_deny).split(",") if s.strip()
 }
 
 # EOL check: map Trivy OS family names to endoflife.date product names
@@ -340,12 +345,38 @@ def scan_trivy_json(image: str, docker_url: str = "") -> dict | None:
 
 # ── License compliance ────────────────────────────────────────────────────────
 
-def _split_spdx_expression(expr: str) -> list[str]:
-    """Split a simple SPDX expression into individual license identifiers."""
-    tokens = [expr]
-    for sep in (" OR ", " AND ", " WITH "):
-        tokens = [piece for tok in tokens for piece in tok.split(sep)]
-    return [t.strip(" ()") for t in tokens if t.strip(" ()")]
+def _denied_licenses(expr: str) -> list[str]:
+    """Return the denied licence ids that make an SPDX expression a violation.
+
+    `A WITH B` keeps A: the exception grants extra permission and is not itself
+    a licence. `A AND B` requires both, so either being denied is a violation.
+    `A OR B` lets the consumer choose, so it is only a violation when no
+    alternative is clean. Parenthesised sub-expressions are flattened rather
+    than parsed — SBOM data in practice is flat.
+    """
+    alternatives = []
+    for alternative in re.split(r"\s+OR\s+", expr):
+        ids = []
+        for term in re.split(r"\s+AND\s+", alternative):
+            base = re.split(r"\s+WITH\s+", term)[0].strip(" ()")
+            if base:
+                ids.append(base)
+        if ids:
+            alternatives.append(ids)
+    if not alternatives:
+        return []
+
+    denied = [[i for i in ids if i in LICENSE_DENY_LIST] for ids in alternatives]
+    if any(not group for group in denied):
+        return []  # at least one alternative is free of denied licences
+
+    seen, out = set(), []
+    for group in denied:
+        for lic_id in group:
+            if lic_id not in seen:
+                seen.add(lic_id)
+                out.append(lic_id)
+    return out
 
 
 def check_licenses(image: str, sbom: dict) -> list[dict]:
@@ -355,15 +386,11 @@ def check_licenses(image: str, sbom: dict) -> list[dict]:
         name = component.get("name", "")
         version = component.get("version", "")
         for lic_entry in component.get("licenses", []):
-            expression = lic_entry.get("expression")
-            if expression:
-                for lic_id in _split_spdx_expression(expression):
-                    if lic_id in LICENSE_DENY_LIST:
-                        violations.append({"package": name, "version": version, "license": lic_id})
-                continue
-            lic = lic_entry.get("license", {})
-            lic_id = lic.get("id") or lic.get("name") or ""
-            if lic_id in LICENSE_DENY_LIST:
+            lic = lic_entry.get("license") or {}
+            # Trivy puts compound expressions in license.id/name at least as
+            # often as in the expression field, so every form is parsed.
+            raw = lic_entry.get("expression") or lic.get("id") or lic.get("name") or ""
+            for lic_id in _denied_licenses(raw):
                 violations.append({"package": name, "version": version, "license": lic_id})
     return violations
 
