@@ -299,23 +299,40 @@ def push_policy_metrics(container_name: str, checks: dict[str, bool], host: str 
 
 # ── Trivy SBOM scan ───────────────────────────────────────────────────────────
 
+def _registry_ref(image: str, docker_url: str) -> str | None:
+    """The image's registry digest, so a remote scan reads the bytes the host runs."""
+    try:
+        digests = _docker_client(docker_url).images.get(image).attrs.get("RepoDigests") or []
+        return digests[0] if digests else None
+    except Exception:
+        return None
+
+
+def _trivy(args: list[str], image: str, docker_url: str) -> subprocess.CompletedProcess:
+    """Run `trivy image` against the Docker host, retrying from the registry on failure.
+
+    Some daemons export an image with a layer blob missing ("not found in tar"), which
+    fails every scan of it; the same digest pulled from its registry scans fine.
+    """
+    base = ["trivy", "image", *args, "--quiet", "--timeout", f"{TRIVY_TIMEOUT}s"]
+    host = ["--docker-host", docker_url] if docker_url else []
+    result = subprocess.run(base + host + [image], capture_output=True, timeout=TRIVY_TIMEOUT + 30)
+    if result.returncode == 0:
+        return result
+    ref = _registry_ref(image, docker_url)
+    if not ref:
+        return result
+    logger.info("  %s — daemon scan failed, retrying from registry as %s", image, ref)
+    retry = subprocess.run(base + ["--image-src", "remote", ref], capture_output=True, timeout=TRIVY_TIMEOUT + 30)
+    return retry if retry.returncode == 0 else result
+
 def scan_sbom(image: str, docker_url: str = "") -> dict | None:
     """Run trivy in CycloneDX mode and return parsed JSON, or None on failure."""
     safe_name = image.replace("/", "_").replace(":", "_")
     out_path = SBOM_DIR / f"{safe_name}.cdx.json"
 
-    cmd = [
-        "trivy", "image",
-        "--format", "cyclonedx",
-        "--quiet",
-        "--timeout", f"{TRIVY_TIMEOUT}s",
-        "--output", str(out_path),
-    ]
-    if docker_url:
-        cmd.extend(["--docker-host", docker_url])
-    cmd.append(image)
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=TRIVY_TIMEOUT + 30)
+        result = _trivy(["--format", "cyclonedx", "--output", str(out_path)], image, docker_url)
         if result.returncode != 0:
             logger.warning(
                 "trivy sbom exited %d for %s: %s",
@@ -338,18 +355,9 @@ def scan_trivy_json(image: str, docker_url: str = "") -> dict | None:
     Trivy returns exit code 1 when vulnerabilities are found — that's still a
     successful scan, so we accept returncodes 0 and 1 and parse stdout either way.
     """
-    cmd = [
-        "trivy", "image",
-        "--format", "json",
-        "--quiet",
-        "--timeout", f"{TRIVY_TIMEOUT}s",
-    ]
-    if docker_url:
-        cmd.extend(["--docker-host", docker_url])
-    cmd.append(image)
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=TRIVY_TIMEOUT + 30)
-        if result.returncode not in (0, 1):
+        result = _trivy(["--format", "json"], image, docker_url)
+        if result.returncode not in (0, 1) or not result.stdout:
             logger.warning(
                 "trivy json exited %d for %s: %s",
                 result.returncode, image,
