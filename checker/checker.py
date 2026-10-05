@@ -170,9 +170,67 @@ def _ts_ms() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
 
 
+# Per-image / per-container series. Dashboards read them with last_over_time(...[8h]),
+# so one that stops being pushed (image replaced, container removed, violation fixed by
+# dropping the key) would keep its last value for 8h. These are zeroed when they go away.
+KEYED_METRICS = (
+    "cib_policy_violation",
+    "cib_license_violation",
+    "cib_license_violations_total",
+    "cib_image_eol",
+    "cib_eol_unknown",
+)
+_LINE_RE = re.compile(r'^(\w+)\{(.*)\} ')
+_LABEL_RE = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
+_emitted: set[tuple[str, frozenset]] = set()
+
+
+def _series_key(name: str, labels: dict) -> tuple[str, frozenset]:
+    return name, frozenset((k, v) for k, v in labels.items() if k != "__name__")
+
+
+def _record(line: str) -> None:
+    m = _LINE_RE.match(line)
+    if m and m.group(1) in KEYED_METRICS:
+        labels = {k: re.sub(r'\\(.)', lambda e: "\n" if e.group(1) == "n" else e.group(1), v)
+                  for k, v in _LABEL_RE.findall(m.group(2))}
+        _emitted.add(_series_key(m.group(1), labels))
+
+
+def zero_stale_series(scanned_hosts: set[str]) -> None:
+    """Push 0 for keyed series still non-zero in VM but not emitted by this scan.
+
+    Seeded from VM rather than memory so it also covers series left by a scan that ran
+    before a restart. Only hosts that were reachable this scan are touched: an offline
+    host should go stale, not read as clean.
+    """
+    ts = _ts_ms()
+    lines = []
+    for name in KEYED_METRICS:
+        try:
+            r = SESSION.get(f"{VICTORIAMETRICS_URL}/api/v1/query",
+                            params={"query": f"last_over_time({name}[9h]) != 0"}, timeout=10)
+            r.raise_for_status()
+            results = r.json()["data"]["result"]
+        except Exception as e:
+            logger.warning("Could not read %s from VictoriaMetrics, not zeroing it: %s", name, e)
+            continue
+        for item in results:
+            labels = {k: v for k, v in item["metric"].items() if k != "__name__"}
+            if labels.get("host") not in scanned_hosts or _series_key(name, labels) in _emitted:
+                continue
+            body = ",".join(f'{k}="{_safe_label(v)}"' for k, v in sorted(labels.items()))
+            lines.append(f"{name}{{{body}}} 0 {ts}")
+    if lines:
+        logger.info("Zeroing %d series no longer reported", len(lines))
+        _push(lines)
+
+
 def _push(lines: list[str]) -> None:
     if not lines:
         return
+    for line in lines:
+        _record(line)
     payload = "\n".join(lines) + "\n"
     for attempt in range(2):
         try:
@@ -545,6 +603,8 @@ def run_scan() -> None:
     total_containers = 0
     total_images = 0
     eol_count = 0
+    scanned_hosts: set[str] = set()
+    _emitted.clear()
 
     def scan_image_full(image: str, docker_url: str, host_name: str) -> None:
         nonlocal total_images, eol_count
@@ -605,6 +665,8 @@ def run_scan() -> None:
             scan_image_full(image, docker_url, host_name)
         if _shutdown.is_set():
             break
+        if containers and images:
+            scanned_hosts.add(host_name)
 
     # Scan ADDITIONAL_IMAGES once, outside the per-host loop, under "additional" host label
     if ADDITIONAL_IMAGES and not _shutdown.is_set():
@@ -614,7 +676,11 @@ def run_scan() -> None:
                 logger.info("Shutdown requested — aborting scan loop")
                 break
             scan_image_full(image, "", "additional")
+        else:
+            scanned_hosts.add("additional")
 
+    if not _shutdown.is_set():
+        zero_stale_series(scanned_hosts)
     push_summary(total_images, total_containers, total_violations, eol_count)
     logger.info("─── CIB scan complete in %.0fs across %d host(s) ───",
                 time.time() - ts_start, len(hosts))
