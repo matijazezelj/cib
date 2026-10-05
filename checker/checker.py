@@ -170,9 +170,67 @@ def _ts_ms() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
 
 
+# Per-image / per-container series. Dashboards read them with last_over_time(...[8h]),
+# so one that stops being pushed (image replaced, container removed, violation fixed by
+# dropping the key) would keep its last value for 8h. These are zeroed when they go away.
+KEYED_METRICS = (
+    "cib_policy_violation",
+    "cib_license_violation",
+    "cib_license_violations_total",
+    "cib_image_eol",
+    "cib_eol_unknown",
+)
+_LINE_RE = re.compile(r'^(\w+)\{(.*)\} ')
+_LABEL_RE = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
+_emitted: set[tuple[str, frozenset]] = set()
+
+
+def _series_key(name: str, labels: dict) -> tuple[str, frozenset]:
+    return name, frozenset((k, v) for k, v in labels.items() if k != "__name__")
+
+
+def _record(line: str) -> None:
+    m = _LINE_RE.match(line)
+    if m and m.group(1) in KEYED_METRICS:
+        labels = {k: re.sub(r'\\(.)', lambda e: "\n" if e.group(1) == "n" else e.group(1), v)
+                  for k, v in _LABEL_RE.findall(m.group(2))}
+        _emitted.add(_series_key(m.group(1), labels))
+
+
+def zero_stale_series(scanned_hosts: set[str]) -> None:
+    """Push 0 for keyed series still non-zero in VM but not emitted by this scan.
+
+    Seeded from VM rather than memory so it also covers series left by a scan that ran
+    before a restart. Only hosts that were reachable this scan are touched: an offline
+    host should go stale, not read as clean.
+    """
+    ts = _ts_ms()
+    lines = []
+    for name in KEYED_METRICS:
+        try:
+            r = SESSION.get(f"{VICTORIAMETRICS_URL}/api/v1/query",
+                            params={"query": f"last_over_time({name}[9h]) != 0"}, timeout=10)
+            r.raise_for_status()
+            results = r.json()["data"]["result"]
+        except Exception as e:
+            logger.warning("Could not read %s from VictoriaMetrics, not zeroing it: %s", name, e)
+            continue
+        for item in results:
+            labels = {k: v for k, v in item["metric"].items() if k != "__name__"}
+            if labels.get("host") not in scanned_hosts or _series_key(name, labels) in _emitted:
+                continue
+            body = ",".join(f'{k}="{_safe_label(v)}"' for k, v in sorted(labels.items()))
+            lines.append(f"{name}{{{body}}} 0 {ts}")
+    if lines:
+        logger.info("Zeroing %d series no longer reported", len(lines))
+        _push(lines)
+
+
 def _push(lines: list[str]) -> None:
     if not lines:
         return
+    for line in lines:
+        _record(line)
     payload = "\n".join(lines) + "\n"
     for attempt in range(2):
         try:
@@ -299,23 +357,40 @@ def push_policy_metrics(container_name: str, checks: dict[str, bool], host: str 
 
 # ── Trivy SBOM scan ───────────────────────────────────────────────────────────
 
+def _registry_ref(image: str, docker_url: str) -> str | None:
+    """The image's registry digest, so a remote scan reads the bytes the host runs."""
+    try:
+        digests = _docker_client(docker_url).images.get(image).attrs.get("RepoDigests") or []
+        return digests[0] if digests else None
+    except Exception:
+        return None
+
+
+def _trivy(args: list[str], image: str, docker_url: str) -> subprocess.CompletedProcess:
+    """Run `trivy image` against the Docker host, retrying from the registry on failure.
+
+    Some daemons export an image with a layer blob missing ("not found in tar"), which
+    fails every scan of it; the same digest pulled from its registry scans fine.
+    """
+    base = ["trivy", "image", *args, "--quiet", "--timeout", f"{TRIVY_TIMEOUT}s"]
+    host = ["--docker-host", docker_url] if docker_url else []
+    result = subprocess.run(base + host + [image], capture_output=True, timeout=TRIVY_TIMEOUT + 30)
+    if result.returncode == 0:
+        return result
+    ref = _registry_ref(image, docker_url)
+    if not ref:
+        return result
+    logger.info("  %s — daemon scan failed, retrying from registry as %s", image, ref)
+    retry = subprocess.run(base + ["--image-src", "remote", ref], capture_output=True, timeout=TRIVY_TIMEOUT + 30)
+    return retry if retry.returncode == 0 else result
+
 def scan_sbom(image: str, docker_url: str = "") -> dict | None:
     """Run trivy in CycloneDX mode and return parsed JSON, or None on failure."""
     safe_name = image.replace("/", "_").replace(":", "_")
     out_path = SBOM_DIR / f"{safe_name}.cdx.json"
 
-    cmd = [
-        "trivy", "image",
-        "--format", "cyclonedx",
-        "--quiet",
-        "--timeout", f"{TRIVY_TIMEOUT}s",
-        "--output", str(out_path),
-    ]
-    if docker_url:
-        cmd.extend(["--docker-host", docker_url])
-    cmd.append(image)
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=TRIVY_TIMEOUT + 30)
+        result = _trivy(["--format", "cyclonedx", "--output", str(out_path)], image, docker_url)
         if result.returncode != 0:
             logger.warning(
                 "trivy sbom exited %d for %s: %s",
@@ -338,18 +413,9 @@ def scan_trivy_json(image: str, docker_url: str = "") -> dict | None:
     Trivy returns exit code 1 when vulnerabilities are found — that's still a
     successful scan, so we accept returncodes 0 and 1 and parse stdout either way.
     """
-    cmd = [
-        "trivy", "image",
-        "--format", "json",
-        "--quiet",
-        "--timeout", f"{TRIVY_TIMEOUT}s",
-    ]
-    if docker_url:
-        cmd.extend(["--docker-host", docker_url])
-    cmd.append(image)
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=TRIVY_TIMEOUT + 30)
-        if result.returncode not in (0, 1):
+        result = _trivy(["--format", "json"], image, docker_url)
+        if result.returncode not in (0, 1) or not result.stdout:
             logger.warning(
                 "trivy json exited %d for %s: %s",
                 result.returncode, image,
@@ -435,11 +501,16 @@ def push_license_metrics(image: str, violations: list[dict], total_components: i
 
 # ── EOL check ─────────────────────────────────────────────────────────────────
 
-def _parse_version_cycle(os_name: str) -> str:
-    """Extract the major.minor cycle from an OS version string."""
-    # Ubuntu: "22.04" → "22.04"; Debian: "12" → "12"; Alpine: "3.19.0" → "3.19"
+# endoflife.date names these cycles by major version only, while Trivy reports the
+# point release (Debian "13.6", RHEL "9.4"); asking for "13.6" is a 404.
+MAJOR_ONLY_CYCLES = {"debian", "rhel", "centos", "rocky-linux", "almalinux", "oracle-linux"}
+
+
+def _parse_version_cycle(os_name: str, product: str = "") -> str:
+    """Extract the release cycle endoflife.date uses from an OS version string."""
+    # Ubuntu: "22.04" → "22.04"; Debian: "13.6" → "13"; Alpine: "3.19.0" → "3.19"
     parts = os_name.split(".")
-    if len(parts) >= 2:
+    if len(parts) >= 2 and product not in MAJOR_ONLY_CYCLES:
         return f"{parts[0]}.{parts[1]}"
     return parts[0]
 
@@ -459,7 +530,7 @@ def check_eol(image: str, trivy_data: dict) -> dict | None:
         logger.debug("no EOL data for %s", family)
         return None
 
-    cycle = _parse_version_cycle(os_name)
+    cycle = _parse_version_cycle(os_name, product)
 
     try:
         r = SESSION.get(
@@ -537,6 +608,8 @@ def run_scan() -> None:
     total_containers = 0
     total_images = 0
     eol_count = 0
+    scanned_hosts: set[str] = set()
+    _emitted.clear()
 
     def scan_image_full(image: str, docker_url: str, host_name: str) -> None:
         nonlocal total_images, eol_count
@@ -597,6 +670,8 @@ def run_scan() -> None:
             scan_image_full(image, docker_url, host_name)
         if _shutdown.is_set():
             break
+        if containers and images:
+            scanned_hosts.add(host_name)
 
     # Scan ADDITIONAL_IMAGES once, outside the per-host loop, under "additional" host label
     if ADDITIONAL_IMAGES and not _shutdown.is_set():
@@ -606,7 +681,11 @@ def run_scan() -> None:
                 logger.info("Shutdown requested — aborting scan loop")
                 break
             scan_image_full(image, "", "additional")
+        else:
+            scanned_hosts.add("additional")
 
+    if not _shutdown.is_set():
+        zero_stale_series(scanned_hosts)
     push_summary(total_images, total_containers, total_violations, eol_count)
     logger.info("─── CIB scan complete in %.0fs across %d host(s) ───",
                 time.time() - ts_start, len(hosts))
