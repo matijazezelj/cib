@@ -5,7 +5,8 @@ services:
     container_name: cib-checker
     restart: unless-stopped
     volumes:
-      # Remove this line when using DOCKER_HOST=tcp://... (remote daemon)
+      # Remove this line when using DOCKER_HOST(S)=tcp://... (remote daemon or read-only proxy).
+      # `:ro` makes the socket file read-only, NOT the API behind it: this is still root on the host.
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - cib-trivy-cache:/root/.cache/trivy
       - cib-data:/data
@@ -16,6 +17,7 @@ services:
       - TRIVY_TIMEOUT=${TRIVY_TIMEOUT:-300}
       - ADDITIONAL_IMAGES=${ADDITIONAL_IMAGES:-}
       - LICENSE_DENY_LIST=${LICENSE_DENY_LIST:-}
+      - LICENSE_PROFILE=${LICENSE_PROFILE:-product}
       - DOCKER_HOST=${DOCKER_HOST:-}
       - DOCKER_HOSTS=${DOCKER_HOSTS:-}
     networks:
@@ -24,7 +26,7 @@ services:
       - cib-victoriametrics
 
   cib-victoriametrics:
-    image: victoriametrics/victoria-metrics:latest
+    image: victoriametrics/victoria-metrics:${VICTORIAMETRICS_TAG:-v1.153.0}
     container_name: cib-victoriametrics
     restart: unless-stopped
     ports:
@@ -39,14 +41,14 @@ services:
       - cib
 
   cib-grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:${GRAFANA_TAG:-13.2.3}
     container_name: cib-grafana
     restart: unless-stopped
     ports:
       - "${BIND_ADDR:-127.0.0.1}:${GRAFANA_PORT:-3003}:3000"
     environment:
       - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-changeme}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD is not set; copy .env.example to .env and set it}
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/etc/grafana/dashboards/cib-overview.json
     volumes:

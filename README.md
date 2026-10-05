@@ -57,7 +57,8 @@ The first scan starts immediately (5–15 minutes, Trivy pulls license DB on fir
 | `TRIVY_TIMEOUT` | `300` | Trivy timeout per image (seconds) |
 | `ADDITIONAL_IMAGES` | — | Extra images to scan beyond running containers |
 | `DOCKER_HOST` | — | Remote Docker daemon (`tcp://host:port`); leave unset for local socket |
-| `LICENSE_DENY_LIST` | GPL/AGPL | Comma-separated SPDX IDs to flag as violations |
+| `LICENSE_PROFILE` | `product` | `product` (any GPL/AGPL), `internal` (AGPL only; for self-hosting), `none` |
+| `LICENSE_DENY_LIST` | per profile | Comma-separated SPDX IDs to flag; overrides the profile |
 
 ### Customising the license deny list
 
