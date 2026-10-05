@@ -501,11 +501,16 @@ def push_license_metrics(image: str, violations: list[dict], total_components: i
 
 # ── EOL check ─────────────────────────────────────────────────────────────────
 
-def _parse_version_cycle(os_name: str) -> str:
-    """Extract the major.minor cycle from an OS version string."""
-    # Ubuntu: "22.04" → "22.04"; Debian: "12" → "12"; Alpine: "3.19.0" → "3.19"
+# endoflife.date names these cycles by major version only, while Trivy reports the
+# point release (Debian "13.6", RHEL "9.4"); asking for "13.6" is a 404.
+MAJOR_ONLY_CYCLES = {"debian", "rhel", "centos", "rocky-linux", "almalinux", "oracle-linux"}
+
+
+def _parse_version_cycle(os_name: str, product: str = "") -> str:
+    """Extract the release cycle endoflife.date uses from an OS version string."""
+    # Ubuntu: "22.04" → "22.04"; Debian: "13.6" → "13"; Alpine: "3.19.0" → "3.19"
     parts = os_name.split(".")
-    if len(parts) >= 2:
+    if len(parts) >= 2 and product not in MAJOR_ONLY_CYCLES:
         return f"{parts[0]}.{parts[1]}"
     return parts[0]
 
@@ -525,7 +530,7 @@ def check_eol(image: str, trivy_data: dict) -> dict | None:
         logger.debug("no EOL data for %s", family)
         return None
 
-    cycle = _parse_version_cycle(os_name)
+    cycle = _parse_version_cycle(os_name, product)
 
     try:
         r = SESSION.get(
