@@ -66,12 +66,32 @@ DOCKER_HOST = os.environ.get("DOCKER_HOST", "")
 
 # Licenses that violate policy by default (copyleft — problematic for proprietary stacks)
 _default_deny = "GPL-2.0-only,GPL-2.0-or-later,GPL-3.0-only,GPL-3.0-or-later,AGPL-3.0-only,AGPL-3.0-or-later"
+# Named policy profiles, so "what counts as a violation" is a one-word decision
+# instead of a hand-typed list of SPDX ids.
+#   product  (default) any GPL/AGPL: right for a team that ships proprietary software
+#   internal           network-copyleft only (AGPL): right for running software on your own
+#                      hardware, where GPL on OS base-image packages is normal and not a
+#                      compliance event. Without this the checker reports thousands of rows
+#                      on an ordinary Debian/Alpine-based estate and the signal is lost.
+#   none               licence checking off (SBOM and EOL checks still run)
+LICENSE_PROFILES = {
+    "product": _default_deny,
+    "internal": "AGPL-3.0-only,AGPL-3.0-or-later",
+    "none": "",
+}
+LICENSE_PROFILE = (os.environ.get("LICENSE_PROFILE") or "product").strip().lower()
+if LICENSE_PROFILE not in LICENSE_PROFILES:
+    raise SystemExit(
+        f"LICENSE_PROFILE={LICENSE_PROFILE!r} is not one of {sorted(LICENSE_PROFILES)}"
+    )
+
 # `or` rather than a get() default: docker-compose passes
 # LICENSE_DENY_LIST=${LICENSE_DENY_LIST:-}, so the variable is always *set* and
 # a get() default never applies — which silently left the deny list empty and
 # license checking a no-op for every compose-based run.
+# An explicit LICENSE_DENY_LIST always wins over the profile.
 LICENSE_DENY_LIST = {
-    s.strip() for s in (os.environ.get("LICENSE_DENY_LIST") or _default_deny).split(",") if s.strip()
+    s.strip() for s in (os.environ.get("LICENSE_DENY_LIST") or LICENSE_PROFILES[LICENSE_PROFILE]).split(",") if s.strip()
 }
 
 # EOL check: map Trivy OS family names to endoflife.date product names

@@ -11,12 +11,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Validate Compose model
-        run: docker compose config >/tmp/compose.yml
+      - name: Compose refuses to start without secrets
+        run: |
+          if docker compose config >/dev/null 2>&1; then
+            echo "::error::compose rendered without a .env: a required secret has a default again"; exit 1
+          fi
+      - name: Validate Compose model (with generated secrets)
+        run: |
+          cp .env.example .env
+          sed -i -E 's/=(GENERATE_ME|CHANGE_ME)$/='"$(openssl rand -hex 16)"'/' .env
+          docker compose config >/tmp/compose.yml
       - name: Python syntax
         run: |
           files=$(git ls-files '*.py')
           if [ -n "$files" ]; then python -m py_compile $files; fi
+      - name: CIB licence-profile tests
+        run: |
+          pip install -q -r checker/requirements.txt
+          python -m unittest discover -s checker/tests -v
       - name: Build local images
         run: |
           docker compose build
